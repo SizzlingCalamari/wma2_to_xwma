@@ -2,11 +2,31 @@
 #include <stdint.h>
 #include <string.h>
 #include <assert.h>
+#include <algorithm>
+
+#pragma pack(push, 1)
+
+struct WaveFormatEx
+{
+    uint16_t wFormatTag;
+    uint16_t nChannels;
+    uint32_t nSamplesPerSec;
+    uint32_t nAvgBytesPerSec;
+    uint16_t nBlockAlign;
+    uint16_t wBitsPerSample;
+    uint16_t cbSize;
+};
+
+struct SpreadAudioErrorCorrectionData
+{
+    uint8_t span;
+    uint16_t virtualPacketLength;
+    uint16_t virtualChunkLength;
+    uint16_t silenceDataLength;
+};
 
 namespace asf
 {
-#pragma pack(push, 1)
-
     struct GUID
     {
         uint32_t a;
@@ -185,8 +205,24 @@ namespace asf
         };
     }
 
-#pragma pack(pop)
+    union PayloadFlags
+    {
+        uint8_t flags;
+        struct
+        {
+            uint8_t numberOfPayloads : 6;
+            uint8_t payloadLengthType : 2;
+        };
+    };
+
+    union PayloadStreamNumber
+    {
+        uint8_t streamNumber : 7;
+        uint8_t keyFrameBit : 1;
+    };
 }
+
+#pragma pack(pop)
 
 static int fpeek(FILE* fp)
 {
@@ -213,7 +249,7 @@ int main(int argc, char const *argv[])
     uint64_t size;
     bool hasErrorCorrection = false;
 
-    while (!feof(fp))
+    while (fpeek(fp), !feof(fp))
     {
         fread(&guid, sizeof(guid), 1, fp);
         fread(&size, sizeof(size), 1, fp);
@@ -248,7 +284,19 @@ int main(int argc, char const *argv[])
                     assert(stream.flags.reserved == 0);
                     assert(stream.flags.encryptedContentFlag == 0);
                     assert(stream.reserved == 0);
-                    fseek(fp, stream.typeSpecificDataLength + stream.errorCorrectionDataLength, SEEK_CUR);
+
+                    WaveFormatEx format;
+                    SpreadAudioErrorCorrectionData errorData;
+                    assert(sizeof(format) <= stream.typeSpecificDataLength);
+                    assert(sizeof(errorData) <= stream.errorCorrectionDataLength);
+
+                    fread(&format, sizeof(format), 1, fp);
+                    assert(sizeof(format) + format.cbSize == stream.typeSpecificDataLength);
+                    fseek(fp, format.cbSize, SEEK_CUR);
+
+                    fread(&errorData, sizeof(errorData), 1, fp);
+                    assert(sizeof(errorData) + errorData.silenceDataLength == stream.errorCorrectionDataLength);
+                    fseek(fp, errorData.silenceDataLength, SEEK_CUR);
                 }
                 else if (!memcmp(&guid, &asf::ASF_Header_Extension_Object, sizeof(guid)))
                 {
@@ -270,6 +318,7 @@ int main(int argc, char const *argv[])
                         char16_t descriptorName[260];
 
                         fread(&descriptorNameLength, sizeof(descriptorNameLength), 1, fp);
+                        descriptorNameLength = std::min<uint16_t>(descriptorNameLength, sizeof(descriptorName));
                         fread(&descriptorName, 1, descriptorNameLength, fp);
                         fread(&descriptorValueDataType, sizeof(descriptorValueDataType), 1, fp);
                         fread(&descriptorValueLength, sizeof(descriptorValueLength), 1, fp);
@@ -295,8 +344,10 @@ int main(int argc, char const *argv[])
 
                         fread(&type, sizeof(type), 1, fp);
                         fread(&codecNameLength, sizeof(codecNameLength), 1, fp);
+                        codecNameLength = std::min<uint16_t>(codecNameLength, sizeof(codecName) / sizeof(char16_t));
                         fread(&codecName, sizeof(char16_t), codecNameLength, fp);
                         fread(&codecDescriptionLength, sizeof(codecDescriptionLength), 1, fp);
+                        codecDescriptionLength = std::min<uint16_t>(codecDescriptionLength, sizeof(codecDescription) / sizeof(char16_t));
                         fread(&codecDescription, sizeof(char16_t), codecDescriptionLength, fp);
                         fread(&codecInformationLength, sizeof(codecInformationLength), 1, fp);
                         fseek(fp, codecInformationLength, SEEK_CUR);
@@ -325,16 +376,16 @@ int main(int argc, char const *argv[])
                 asf::ErrorCorrectionFlags flags;
                 flags.flags = static_cast<uint8_t>(fpeek(fp));
 
-                assert(flags.errorCorrectionDataLength == 2);
-                assert(!flags.opaqueDataPresent);
-                assert(flags.errorCorrectionLengthType == 0);
-
                 if (flags.errorCorrectionPresent)
                 {
+                    assert(flags.errorCorrectionDataLength == 2);
+                    assert(!flags.opaqueDataPresent);
+                    assert(flags.errorCorrectionLengthType == 0);
+
                     fgetc(fp);
                     asf::ErrorCorrectionData data;
                     fread(&data, sizeof(asf::ErrorCorrectionData), 1, fp);
-                    assert((data.type == 0) && !hasErrorCorrection);
+                    assert((data.type == 0) && (data.cycle == 0) && !hasErrorCorrection);
                 }
 
                 asf::PayloadParsingInformation::LengthTypeFlags lengthTypeFlags;
@@ -343,9 +394,81 @@ int main(int argc, char const *argv[])
                 fread(&lengthTypeFlags, sizeof(lengthTypeFlags), 1, fp);
                 fread(&propertyFlags, sizeof(propertyFlags), 1, fp);
 
-                //assert(!lengthTypeFlags.multiplePayloadsPresent);
                 assert(lengthTypeFlags.sequenceType == 0);
+                assert(lengthTypeFlags.packetLengthType == 0);
+                assert(!lengthTypeFlags.errorCorrectionPresent);
 
+                assert(propertyFlags.replicatedDataLengthType == 1);
+                assert(propertyFlags.offsetIntoMediaObjectLengthType == 3);
+                assert(propertyFlags.mediaObjectNumberLengthType == 1);
+                assert(propertyFlags.streamNumberLengthType == 1);
+
+                uint8_t paddingLength8;
+                uint16_t paddingLength16;
+                uint32_t paddingLength32;
+
+                uint32_t sendTime;
+                uint16_t duration;
+                switch(lengthTypeFlags.paddingLengthType)
+                {
+                case 0:
+                default:
+                    break;
+                case 1:
+                    fread(&paddingLength8, sizeof(paddingLength8), 1, fp);
+                    break;
+                case 2:
+                    fread(&paddingLength16, sizeof(paddingLength16), 1, fp);
+                    break;
+                case 3:
+                    fread(&paddingLength32, sizeof(paddingLength32), 1, fp);
+                    break;
+                }
+                fread(&sendTime, sizeof(sendTime), 1, fp);
+                fread(&duration, sizeof(duration), 1, fp);
+
+                assert(lengthTypeFlags.multiplePayloadsPresent);
+
+                asf::PayloadFlags payloadFlags;
+                fread(&payloadFlags, sizeof(payloadFlags), 1, fp);
+                assert(payloadFlags.numberOfPayloads > 0);
+                assert(payloadFlags.payloadLengthType == 2);
+
+                for (uint8_t j = 0; j < payloadFlags.numberOfPayloads; ++j)
+                {
+                    asf::PayloadStreamNumber streamNumber;
+                    fread(&streamNumber, sizeof(streamNumber), 1, fp);
+
+                    uint8_t mediaObjectNumber;
+                    uint32_t offsetIntoMediaObject;
+                    uint8_t replicatedDataLength;
+                    uint16_t payloadLength;
+
+                    fread(&mediaObjectNumber, sizeof(mediaObjectNumber), 1, fp);
+                    fread(&offsetIntoMediaObject, sizeof(offsetIntoMediaObject), 1, fp);
+                    fread(&replicatedDataLength, sizeof(replicatedDataLength), 1, fp);
+                    assert(replicatedDataLength != 1);
+                    assert(replicatedDataLength == 0 || replicatedDataLength >= 8);
+                    fseek(fp, replicatedDataLength, SEEK_CUR);
+                    fread(&payloadLength, sizeof(payloadLength), 1, fp);
+                    assert(payloadLength > 0);
+                    fseek(fp, payloadLength, SEEK_CUR);
+                }
+                switch (lengthTypeFlags.paddingLengthType)
+                {
+                case 0:
+                default:
+                    break;
+                case 1:
+                    fseek(fp, paddingLength8, SEEK_CUR);
+                    break;
+                case 2:
+                    fseek(fp, paddingLength16, SEEK_CUR);
+                    break;
+                case 3:
+                    fseek(fp, paddingLength32, SEEK_CUR);
+                    break;
+                }
             }
         }
         else
