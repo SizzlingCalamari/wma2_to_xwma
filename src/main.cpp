@@ -3,6 +3,8 @@
 #include <string.h>
 #include <assert.h>
 #include <algorithm>
+#include <list>
+#include <vector>
 
 #pragma pack(push, 1)
 
@@ -17,12 +19,21 @@ struct WaveFormatEx
     uint16_t cbSize;
 };
 
-struct SpreadAudioErrorCorrectionData
+struct Wma2ExtraData
 {
-    uint8_t span;
-    uint16_t virtualPacketLength;
-    uint16_t virtualChunkLength;
-    uint16_t silenceDataLength;
+    uint32_t flags1;
+    union
+    {
+        uint16_t flags2;
+        struct
+        {
+            uint16_t exponentialVLCs : 1;
+            uint16_t useBitReservoir : 1;
+            uint16_t variableBlockLength : 1;
+            uint16_t pad : 13;
+        };
+    };
+    uint32_t unused;
 };
 
 namespace asf
@@ -137,6 +148,14 @@ namespace asf
         uint32_t reserved;
     };
 
+    struct SpreadAudioErrorCorrectionData
+    {
+        uint8_t span;
+        uint16_t virtualPacketLength;
+        uint16_t virtualChunkLength;
+        uint16_t silenceDataLength;
+    };
+
     struct HeaderExtensionObject
     {
         GUID reserved1; // Must be ASF_Reserved_1
@@ -222,6 +241,37 @@ namespace asf
     };
 }
 
+namespace riff
+{
+    struct RiffChunk
+    {
+        uint32_t id;
+        uint32_t size;
+
+        uint32_t format;
+    };
+
+    struct FmtChunk
+    {
+        uint32_t id;
+        uint32_t size;
+
+        WaveFormatEx format;
+    };
+
+    struct DataChunk
+    {
+        uint32_t id;
+        uint32_t size;
+    };
+
+    struct DpdsChunk
+    {
+        uint32_t id;
+        uint32_t size;
+    };
+}
+
 #pragma pack(pop)
 
 static int fpeek(FILE* fp)
@@ -238,12 +288,23 @@ int main(int argc, char const *argv[])
         return -1;
     }
 
-    const char* file = argv[1];
-    FILE* fp = fopen(file, "rb");
+    const char* inputFile = argv[1];
+    FILE* fp = fopen(inputFile, "rb");
     if (!fp)
     {
         return -1;
     }
+
+    FILE* outFp = fopen(argv[2], "wb");
+    if (!outFp)
+    {
+        fclose(fp);
+        return -1;
+    }
+
+    WaveFormatEx waveFormat;
+    Wma2ExtraData extraData;
+    std::list<std::vector<uint8_t>> packets;
 
     asf::GUID guid;
     uint64_t size;
@@ -285,14 +346,15 @@ int main(int argc, char const *argv[])
                     assert(stream.flags.encryptedContentFlag == 0);
                     assert(stream.reserved == 0);
 
-                    WaveFormatEx format;
-                    SpreadAudioErrorCorrectionData errorData;
-                    assert(sizeof(format) <= stream.typeSpecificDataLength);
+                    asf::SpreadAudioErrorCorrectionData errorData;
+                    assert(sizeof(waveFormat) <= stream.typeSpecificDataLength);
                     assert(sizeof(errorData) <= stream.errorCorrectionDataLength);
 
-                    fread(&format, sizeof(format), 1, fp);
-                    assert(sizeof(format) + format.cbSize == stream.typeSpecificDataLength);
-                    fseek(fp, format.cbSize, SEEK_CUR);
+                    fread(&waveFormat, sizeof(waveFormat), 1, fp);
+                    assert(waveFormat.wFormatTag == 0x161); // WMAv2
+                    assert(sizeof(waveFormat) + waveFormat.cbSize == stream.typeSpecificDataLength);
+                    assert(sizeof(extraData) == waveFormat.cbSize);
+                    fread(&extraData, sizeof(extraData), 1, fp);
 
                     fread(&errorData, sizeof(errorData), 1, fp);
                     assert(sizeof(errorData) + errorData.silenceDataLength == stream.errorCorrectionDataLength);
@@ -452,8 +514,13 @@ int main(int argc, char const *argv[])
                     fseek(fp, replicatedDataLength, SEEK_CUR);
                     fread(&payloadLength, sizeof(payloadLength), 1, fp);
                     assert(payloadLength > 0);
-                    fseek(fp, payloadLength, SEEK_CUR);
+
+                    std::vector<uint8_t> payload(payloadLength);
+                    fread(payload.data(), 1, payloadLength, fp);
+
+                    packets.emplace_back(std::move(payload));
                 }
+
                 switch (lengthTypeFlags.paddingLengthType)
                 {
                 case 0:
@@ -476,5 +543,62 @@ int main(int argc, char const *argv[])
             fseek(fp, size, SEEK_CUR);
         }
     }
+    fclose(fp);
+
+    {
+        riff::RiffChunk riff;
+        riff::FmtChunk fmt;
+        riff::DpdsChunk dpds;
+        riff::DataChunk data;
+
+        riff.id = 'FFIR';
+        riff.size = 0;
+        riff.format = 'AMWX';
+
+        fmt.id = ' tmf';
+        fmt.size = sizeof(WaveFormatEx) + waveFormat.cbSize;
+        fmt.format = waveFormat;
+        //fmt.format.cbSize = 0;
+
+        dpds.id = 'sdpd';
+        dpds.size = packets.size() * sizeof(uint32_t);
+
+        fwrite(&riff, sizeof(riff), 1, outFp);
+        fwrite(&fmt, sizeof(fmt), 1, outFp);
+        fwrite(&extraData, sizeof(extraData), 1, outFp);
+        fwrite(&dpds, sizeof(dpds), 1, outFp);
+
+        const uint32_t samplesPerPacket = 2048;
+        const uint32_t uncompressedSamples = samplesPerPacket * packets.size();
+
+        uint32_t dpdsOffset = 0;
+        uint32_t compressedSize = 0;
+        for (const std::vector<uint8_t>& packet : packets)
+        {
+            compressedSize += packet.size();
+
+            dpdsOffset += (samplesPerPacket * fmt.format.wBitsPerSample / 8);
+            fwrite(&dpdsOffset, sizeof(dpdsOffset), 1, outFp);
+        }
+
+        const uint32_t bytesPerSample = fmt.format.wBitsPerSample / 8;
+        const uint32_t duration = dpdsOffset / bytesPerSample;
+
+        assert(uncompressedSamples == duration);
+
+        data.id = 'atad';
+        data.size = compressedSize;
+        fwrite(&data, sizeof(data), 1, outFp);
+
+        for (const std::vector<uint8_t>& packet : packets)
+        {
+            fwrite(packet.data(), 1, packet.size(), outFp);
+        }
+
+        uint32_t riffSize = ftell(outFp) - 8;
+        fseek(outFp, 4, SEEK_SET);
+        fwrite(&riffSize, sizeof(riffSize), 1, outFp);
+    }
+    fclose(outFp);
     return 0;
 }
